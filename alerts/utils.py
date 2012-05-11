@@ -5,6 +5,7 @@ from importutil import dynamic_import
 from rapidsms.contrib.messaging.utils import send_message
 from rapidsms.models import Connection
 import logging
+from rapidsms_httprouter.models import Message
 
 def get_alert_generators(type, *args, **kwargs):
     """
@@ -24,7 +25,7 @@ def get_alert_generators(type, *args, **kwargs):
     except AttributeError:
         # TODO: should this fail harder?
         registered_generators = []
-        
+
     return [dynamic_import(g)(*args, **kwargs) for g in registered_generators]
 
 def get_notifications():
@@ -48,14 +49,22 @@ def trigger_notifications():
 
             def sms_send(user, content):
                 try:
-                    conn = Connection.objects.get(contact__user=user)
+                    #conn = Connection.objects.get(contact__user=user)
+                    _conn = Connection.objects.filter(contact=user)
+                    if len(_conn) > 0:
+                        conn = _conn[0]
+                    else:
+                        conn = None
                 except:
-                    print 'user [%s] has no contact info; can\'t send sms alert' % user_name(user)
-                    logging.exception('error retriving contact info for user [%s]; can\'t send sms alert' % user_name(user))
+                    #print 'user [%s] has no contact info; can\'t send sms alert' % user_name(user)
+                    logging.exception('error retriving contact info for healthprovider [%s]; can\'t send sms alert' % user.name)
                     return
 
-                send_message(conn, content)
-                print 'sent sms alert to [%s]' % user_name(user)
+                #send_message(conn, content)
+                if conn:
+                    Message.objects.create(direction='O', text=content, connection=conn, status='Q')
+
+                #print 'sent sms alert to [%s]' % user_name(user)
 
             notif.trigger_sms(sms_send)
 
