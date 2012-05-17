@@ -4,7 +4,10 @@ from django.contrib.auth.models import User
 from rapidsms.contrib.locations.models import Location
 from rapidsms.models import Contact
 from datetime import datetime, timedelta
-from cvs.utils import total_attribute_value
+#from cvs.utils import total_attribute_value
+from uganda_common.utils import total_attribute_value
+from rapidsms_xforms.models import XFormSubmission, XFormSubmissionValue
+from healthmodels.models.HealthProvider import HealthProvider
 
 def alerttest(request):
     """
@@ -34,7 +37,7 @@ class TestAlertType(NotificationType):
     def users_for_escalation_level(self, esc_level):
         if esc_level == 'district':
             #all users with reporting_district = district
-            return [User.objects.get(username='droos')]
+            return [User.objects.get(username='sam')]
         elif esc_level == 'moh':
             #all users with group 'moh'
             return [User.objects.get(username='admin')]
@@ -56,11 +59,11 @@ def mk_notifiable_disease_alert(disease, alert_type, reporting_period, val, loc)
     notif.originating_location = loc
     return notif
 
-def notifiable_disease_test():
+def notifiable_disease_test(request):
     METRICS = {
         'malaria': {
             'threshold': 3,
-            'slug': 'epi_ma',
+            'slug': 'cases_ma',
             'gen': mk_notifiable_disease_alert,
         }
     }
@@ -70,8 +73,11 @@ def notifiable_disease_test():
     if REPORTING_INTERVAL == 'weekly':
         yr, wk, dow = timestamp.isocalendar()
         reporting_period = '%dw%02d' % (yr, wk)
-        period_start = timestamp.date() - timedelta(days=dow-1)
-        period_end = period_start + timedelta(days=6)
+        #period_start = timestamp.date() - timedelta(days=dow - 1)
+        #period_end = period_start + timedelta(days=6)
+        period_start = datetime(2012, 1, 1)
+        period_end = timestamp
+        print period_start, period_end
     else:
         raise Exception('unsupported reporting interval [%s]' % REPORTING_INTERVAL)
 
@@ -106,5 +112,81 @@ class NotifiableDiseaseThresholdAlert(NotificationType):
             'district': 'district team',
             'moh': 'ministry of health',
             }[esc_level]
+    def sms_users(self):
+        hps = HealthProvider.objects.exclude(reporting_location=None, connection=None).filter(groups__name__in=['DHT']).\
+        filter(reporting_location__type='district', reporting_location__name=self.originating_location.name)
+        return hps
 
+def get_facility_cases_notification(metric, info, debug=False):
+    reporting_range = (datetime(2011, 1, 1), datetime.now())
+    res = {}
+    subs = XFormSubmissionValue.objects.filter(submission__has_errors=False,
+            submission__created__range=reporting_range, value_int__gt=info['threshold'],
+            ).filter(attribute__slug=info['slug'])
+    for sub in subs:
+        if not sub.submission.connection or not sub.submission.connection.contact:
+            continue
+        if not sub.submission.connection.contact.healthproviderbase.healthprovider.facility:
+            continue
+        facility = sub.submission.connection.contact.healthproviderbase.healthprovider.facility
+        loc = sub.submission.connection.contact.reporting_location
+        if loc.type.name == 'district':
+            district = loc
+        else:
+            district = loc.get_ancestors().filter(type__slug='district')[0]
+        val = sub.value_int
+        if district.pk  not in res:
+            if debug:
+                res[district.pk] = {'name':district.name, 'data':{facility.id:{'name':facility.name, 'type':facility.type.name, 'val':val, 'submission':sub.submission.pk}}}
+            else:
+                reporter = '%s(%s)' % (sub.submission.connection.contact.name, sub.submission.connection.identity)
+                res[district.pk] = {'name':district.name, 'data':{facility.id:{'name':facility.name, 'type':facility.type.name, 'val':val, 'reporters':[reporter]}}}
+        else:
+            if facility.id not in res[district.pk]['data']:
+                if debug:
+                    res[district.pk]['data'] = {facility.id:{'name':facility.name, 'type':facility.type.name, 'val':val, 'submission':sub.submission.pk}}
+                else:
+                    reporter = '%s(%s)' % (sub.submission.connection.contact.name, sub.submission.connection.identity)
+                    res[district.pk]['data'] = {facility.id:{'name':facility.name, 'type':facility.type.name , 'val':val, 'reporters':[reporter] }}
+            else:
+                res[district.pk]['data'][facility.id]['val'] += val
+                reporter = '%s(%s)' % (sub.submission.connection.contact.name, sub.submission.connection.identity)
+                if not (res[district.pk]['data'][facility.id]['reporters'].__contains__(reporter)):
+                    res[district.pk]['data'][facility.id]['reporters'].append(reporter)
+    return res
 
+def mk_notifiable_disease_alert2(disease, alert_type, reporting_period, loc, district_data):
+    notif = Notification(alert_type=alert_type)
+    rr = "%s_%s" % (reporting_period[0].date().strftime('%F'), reporting_period[0].strftime('%H:%M-') + reporting_period[1].strftime('%H:%M'))
+    notif.uid = 'disease_%s_%s_%s' % (disease, rr, loc.code)
+    txt = "Urgent - "
+    has_cases = False
+    for d in district_data['data'].values():
+        if d['val'] > 0:
+            has_cases = True
+            txt += "%s at %s %s reported %s cases of %s" % (','.join(d['reporters']), d['name'], d['type'], d['val'], disease)
+    if has_cases:
+        notif.text = txt
+        notif.sms_text = txt
+    else: notif.text = ''
+    notif.url = None
+    notif.originating_location = loc
+    return notif
+
+def notifiable_disease_test2():
+    METRICS = {
+        'malaria': {
+            'threshold': 3,
+            'slug': 'cases_ma',
+            'gen': mk_notifiable_disease_alert2,
+        }
+    }
+    #reporting_period = (datetime.now() - datetime.timedelta(minutes=15), datetime.now())
+    reporting_period = (datetime(2011, 1, 1, 0, 0, 0), datetime.now())
+    for metric, info in METRICS.iteritems():
+        #todo: is the end date inclusive or exclusive?
+        data = get_facility_cases_notification(metric, info, False)
+        for key in data.keys():
+            loc = Location.objects.get(id=key)
+            district_data = data[key]
+            yield info['gen'](metric, 'alerts._prototyping.NotifiableDiseaseThresholdAlert', reporting_period, loc, district_data)
